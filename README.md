@@ -2,6 +2,8 @@
 
 **RAG** stands for **Retrieval-Augmented Generation**. It is an AI architectural pattern that enhances Large Language Models (LLMs) by retrieving relevant information from external knowledge sources (e.g., vector databases, documents, APIs) before generating a response.
 
+> 📍 Everything in these notes is implemented in [`app.py`](app.py) — a minimal, fully local RAG pipeline (Ollama `nomic-embed-text` + `llama3.2:3b`, ChromaDB) over the articles in `news_articles/`.
+
 ---
 
 ## Why RAG?
@@ -115,55 +117,23 @@ flowchart LR
 
 > **💡 Simple Example (Text Vectorization):**  
 > ```python
-> from openai import OpenAI
-> client = OpenAI()
+> # this is my get_openai_embedding() from app.py — Ollama exposes an
+> # OpenAI-compatible endpoint, so the normal openai client works locally
+> client = OpenAI(api_key="ollama", base_url="http://localhost:11434/v1")
 > 
-> # Vectorizing a chunk using an embedding model
+> # Vectorizing a chunk using an embedding model (nomic-embed-text → 768 dims)
 > text_chunk = "Antigravity is an AI coding assistant."
 > response = client.embeddings.create(
->     model="text-embedding-3-small",
+>     model="nomic-embed-text",
 >     input=text_chunk
 > )
 > 
 > vector = response.data[0].embedding
-> print(vector[:3])  # e.g., [-0.0182, 0.0341, -0.0094, ...] (1536 float values)
+> print(vector[:3])  # e.g., [-0.0182, 0.0341, -0.0094, ...] (768 float values)
 > ```
 
 > **💡 Simple Example (Multimodal with CLIP):**  
 > An image of a Golden Retriever and the text `"a cute golden retriever dog playing"` are encoded by CLIP into two separate vectors. Because they share the same semantic space, calculating cosine similarity between the image vector and the text query vector yields a very high score (~0.92).
-
-#### The "Layers" Concept in Embedding Models
-
-Deep embedding models (such as BERT, RoBERTa, or modern Transformer encoders) consist of a stacked sequence of neural network layers (e.g., 12, 24, or 32 layers). Each layer refines and abstracts the information at different conceptual depths:
-
-```mermaid
-flowchart TD
-    subgraph Layers ["Internal Layer Architecture"]
-        Input["Input Tokens + Positional Encodings"] --> L0["Input Embedding Layer"]
-        L0 --> L1["Lower Layers (1-4)\nSyntax, grammar, spelling, word forms"]
-        L1 --> L2["Middle Layers (5-8)\nPhrasal structures, clause semantics"]
-        L2 --> L3["Higher Layers (9-12+)\nAbstract meaning, global intent, context"]
-    end
-    L3 --> Pool["Pooling Layer\n(Mean Pooling / [CLS] Token)"]
-    Pool --> Final["Final Chunk Vector\n(e.g., 768 or 1536 floats)"]
-```
-
-1. **Layer Hierarchy (What Each Depth Learns):**
-   - **Input Embedding Layer:** Converts token IDs to initial static vector lookups and adds positional encodings (giving the model awareness of word order).
-   - **Early / Lower Layers:** Learn low-level surface features—word spelling, morphology, parts of speech, and local syntax.
-   - **Middle Layers:** Capture clause-level relationships, dependency trees, and syntactic structures.
-   - **Late / Higher Layers:** Capture high-level abstractions, domain context, semantic intent, and document-level nuance.
-
-2. **Layer Extraction Strategies (Which Layer to Use?):**
-   - **Last Hidden State (`layer -1`):** The standard default in modern sentence encoders. Represents the deepest semantic distillation.
-   - **Second-to-Last Hidden State (`layer -2`):** Often preferred when fine-tuning or transferring representations, as it avoids bias introduced by the model's final pre-training loss head (e.g., masked language modeling).
-   - **Multi-Layer Concatenation / Summation:** Combining the activations of the top 4 layers (e.g., layers 9–12 in BERT-base). Research in the original BERT paper demonstrated this often outperforms using only the final layer for general semantic tasks.
-
-3. **The Pooling Layer (Sequence Matrix $\rightarrow$ Single Chunk Vector):**
-   Because a transformer outputs an individual vector for *every token* in the text sequence (e.g., shape `[sequence_length, hidden_dimension]`), a pooling mechanism collapses this matrix into a single vector representing the entire chunk:
-   - **Mean Pooling (Recommended in RAG):** Calculates the element-wise average across all active token vectors (ignoring padding tokens). Used by Sentence-BERT, BGE, and E5 models.
-   - **`[CLS]` Token Pooling:** Uses the hidden vector corresponding to the special classification token prepended to the input.
-   - **Max Pooling:** Takes the maximum value across all token vectors for each dimension to highlight the strongest activated features.
 
 ---
 
@@ -202,34 +172,137 @@ Although often used interchangeably, there is an important architectural distinc
 
 ---
 
-## Minimal End-to-End Walkthrough
+## Full Flow of `app.py` (step by step)
 
-Here is how all these pieces fit together in a simple RAG workflow:
+```mermaid
+flowchart LR
+    Setup["0. Setup\nOllama + Chroma"] --> Load["2. Load\nnews_articles/*.txt"]
+    Load --> Chunk["3. Chunk\n1000 chars, 20 overlap"]
+    Chunk --> Embed["4. Embed\nnomic-embed-text"]
+    Embed --> Store["5. Store\nChroma upsert"]
+    Store --> Query["6. Retrieve\ntop-2 chunks"]
+    Query --> Gen["7. Generate\nllama3.2:3b"]
+```
+
+### 0. Setup — connect everything (runs on import)
 
 ```python
-# 1. Parse & Preprocess
-raw_doc = "Employee handbook... Vacation Policy: 20 PTO days."
-cleaned_doc = raw_doc.strip()
+OLLAMA_URL = "http://localhost:11434/v1"          # Ollama's OpenAI-compatible endpoint
 
-# 2. Chunk
-chunks = [cleaned_doc]  # (or split into smaller segments)
+local_ef = embedding_functions.OpenAIEmbeddingFunction(
+    api_key="ollama",                              # any non-empty string, nothing billed
+    api_base=OLLAMA_URL,
+    model_name="nomic-embed-text",                 # the embedding model
+)
 
-# 3. Vectorize with an Embedding Model
-query = "How many vacation days do I get?"
-query_vector = embed_model.encode(query)      # e.g., [0.21, -0.45, ...]
-chunk_vectors = embed_model.encode(chunks)   # e.g., [[0.23, -0.42, ...]]
+chroma_client = chromadb.PersistentClient(path="chroma_persistent_storage")
+collection = chroma_client.get_or_create_collection(
+    name="document_qa_collection_local",
+    embedding_function=local_ef,                   # Chroma uses this to embed queries later
+)
 
-# 4. Index & Store in Vector DB / Store
-vector_db.add(vectors=chunk_vectors, documents=chunks)
-
-# 5. Retrieve via Vector Search (using Index)
-top_chunk = vector_db.search(query_vector, top_k=1)
-
-# 6. Augment & Generate with LLM
-prompt = f"Answer the query using this context:\n{top_chunk}\n\nQuestion: {query}"
-response = llm.generate(prompt)
-print(response)  # "You receive 20 days of PTO annually."
+client = OpenAI(api_key="ollama", base_url=OLLAMA_URL)   # client for the chat model
 ```
+
+**Why:** Chroma needs to know the embedding function *now* so that at query time it can embed the question in the **same vector space** as the chunks. `PersistentClient` = data survives restarts (stored as SQLite in `chroma_persistent_storage/`).
+
+### 1. Sanity check — is Ollama + llama3.2:3b alive?
+
+```python
+response = client.chat.completions.create(
+    model="llama3.2:3b",
+    messages=[{"role": "user", "content": "Explain RAG in two sentences."}],
+)
+print(response.choices[0].message.content)
+```
+
+**Why:** fail fast — if this works, the chat model is reachable before doing the slow embedding work.
+
+### 2. Load documents
+
+```python
+def load_documents_from_directory(directory_path):
+    documents = []
+    for filename in os.listdir(directory_path):
+        if filename.endswith(".txt"):
+            documents.append({"id": filename, "text": file.read()})
+    return documents
+
+documents = load_documents_from_directory("./news_articles")
+# → [{"id": "05-03-databricks-acquires-....txt", "text": "..."}, ...]
+```
+
+### 3. Chunk
+
+```python
+def split_text(text, chunk_size=1000, chunk_overlap=20):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = start + chunk_size
+        chunks.append(text[start:end])
+        start = end - chunk_overlap          # next chunk starts 20 chars back
+    return chunks
+
+# for every document → chunks with ids "filename.txt_chunk_1", "filename.txt_chunk_2", ...
+```
+
+### 4. Embed every chunk
+
+```python
+def get_openai_embedding(text):
+    response = client.embeddings.create(input=text, model="nomic-embed-text")
+    return response.data[0].embedding        # 768-dim vector
+
+doc["embedding"] = get_openai_embedding(doc["text"])
+# → [{"id": ..., "text": chunk, "embedding": [0.01, -0.3, ...]}, ...]
+```
+
+### 5. Store in Chroma
+
+```python
+collection.upsert(ids=[doc["id"]], documents=[doc["text"]], embeddings=[doc["embedding"]])
+# collection now holds [{id, chunk, embedding}, ...] and builds its HNSW index
+```
+
+**Why `upsert` not `insert`:** re-running the script overwrites the same ids instead of duplicating chunks.
+
+### 6. Retrieve
+
+```python
+def query_documents(question, n_results=2):
+    results = collection.query(query_texts=question, n_results=n_results)
+    # flatten results["documents"] → [chunk1, chunk2]
+
+relevant_chunks = query_documents("tell me about databricks")
+```
+
+**What happens inside:** Chroma embeds the question itself (using `local_ef` from step 0) and returns the 2 nearest chunks — that's the semantic search hitting the Databricks/Okera article.
+
+### 7. Augment + Generate
+
+```python
+def generate_response(question, relevant_chunks):
+    context = "\n\n".join(relevant_chunks)
+    prompt = ("You are an assistant for question-answering tasks. Use the following pieces of "
+              "retrieved context ... Use three sentences maximum ... "
+              "\n\nContext:\n" + context)
+
+    response = client.chat.completions.create(
+        model="llama3.2:3b",
+        messages=[
+            {"role": "system", "content": prompt},      # ← the retrieved context
+            {"role": "user", "content": question},
+        ],
+    )
+    return response.choices[0].message.content
+```
+
+**This is the "Augment" step:** retrieved chunks go into the *system* prompt, the question stays as the *user* message, and the LLM answers grounded in the context.
+
+> ⚠️ Key detail: chunks are embedded **manually** (step 4 → explicit `embeddings=`),
+> while the query is embedded **by Chroma** (step 6 → `query_texts`). Both must
+> use `nomic-embed-text` — different models = incompatible vector spaces = garbage retrieval.
 
 
 
