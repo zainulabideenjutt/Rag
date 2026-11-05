@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Environment variables and local configuration
+.env
+.env.*
+!.env.example
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Generated RAG data and local vector-store indexes
+chroma_db/
+vectorstore/
+faiss.index
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
